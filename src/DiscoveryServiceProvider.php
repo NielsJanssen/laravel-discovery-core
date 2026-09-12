@@ -4,9 +4,12 @@ declare(strict_types=1);
 
 namespace NielsJanssen\Laravel\Discovery;
 
+use Illuminate\Contracts\Container\BindingResolutionException;
 use Illuminate\Support\ServiceProvider;
+use NielsJanssen\Laravel\Discovery\Cache\MemoryAdapter;
 use Symfony\Component\Cache\Adapter\PhpFilesAdapter;
 use Tempest\Discovery\BootDiscovery;
+use Tempest\Discovery\CouldNotStoreDiscoveryCache;
 use Tempest\Discovery\Discovery;
 use Tempest\Discovery\DiscoveryCache;
 use Tempest\Discovery\DiscoveryCacheStrategy;
@@ -48,9 +51,12 @@ class DiscoveryServiceProvider extends ServiceProvider
                 strategy: $this->app->environment($config->array('discovery.cache_environments', ['production']))
                     ? DiscoveryCacheStrategy::FULL
                     : DiscoveryCacheStrategy::NONE,
-                pool: new PhpFilesAdapter(
-                    directory: storage_path($config->string('discovery.cache_path', 'framework/cache/discovery')),
-                ),
+                pool: match ($config->string('discovery.cache_store', 'files')) {
+                    'memory' => MemoryAdapter::forProcess(),
+                    default => new PhpFilesAdapter(
+                        directory: storage_path($this->app->make('config')->string('discovery.cache_path', 'framework/cache/discovery')),
+                    ),
+                },
             );
         });
 
@@ -66,6 +72,8 @@ class DiscoveryServiceProvider extends ServiceProvider
         /** @var Discovery[] $discoveries */
         $discoveries = $this->app->call(BootDiscovery::class);
 
+        $this->warmMemoryCache($discoveries);
+
         $this->app->make('config')->set(
             'discovery.discovery_classes',
             array_map(
@@ -73,5 +81,33 @@ class DiscoveryServiceProvider extends ServiceProvider
                 $discoveries,
             ),
         );
+    }
+
+    /**
+     * Warmup the in-process memory cache if it is enabled.
+     *
+     * @param Discovery[] $discoveries
+     *
+     * @throws BindingResolutionException
+     * @throws CouldNotStoreDiscoveryCache
+     */
+    private function warmMemoryCache(array $discoveries): void
+    {
+        if ($this->app->make('config')->string('discovery.cache_store') !== 'memory') {
+            return;
+        }
+
+        $pool = MemoryAdapter::forProcess();
+        $cache = $this->app->make(DiscoveryCache::class);
+
+        if (! $cache->enabled || $pool->isWarm()) {
+            return;
+        }
+
+        $pool->markWarm();
+
+        foreach ($this->app->make(DiscoveryConfig::class)->locations as $location) {
+            $cache->store($location, $discoveries);
+        }
     }
 }
